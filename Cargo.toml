@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["number", "alerts"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/tuffinmuffin/raptaboard-examples"
+rust-version = "1.97"
+
+# raptaboard's plugin SDK and its test harness, at the commit with the API
+# these are written for (0.3). Move both together.
+[workspace.dependencies]
+raptaboard-plugin = { git = "https://github.com/tuffinmuffin/raptaboard", rev = "6a689320bde82d3f6545588a8888f94541b068cc" }
+raptaboard-plugin-test = { git = "https://github.com/tuffinmuffin/raptaboard", rev = "6a689320bde82d3f6545588a8888f94541b068cc" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

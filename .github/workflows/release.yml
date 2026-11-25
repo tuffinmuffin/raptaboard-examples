@@ -1,0 +1,45 @@
+name: Release
+
+# Tag vX.Y.Z to publish a release, or vX.Y.Z-pre.N (any tag with a "-") to
+# publish a pre-release. Either holds each plugin as <name>.wasm with its
+# manifest beside it as <name>.toml, which raptaboard-content's packs point at.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - name: Tests
+        run: cargo test
+      - name: Build the plugins
+        run: cargo build --release --target wasm32-wasip2
+      - name: Collect them
+        run: |
+          mkdir dist
+          for p in number alerts; do
+            cp "target/wasm32-wasip2/release/$p.wasm" "dist/$p.wasm"
+            cp "$p/plugin.toml" "dist/$p.toml"
+          done
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls -la dist
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=()
+          case "$GITHUB_REF_NAME" in *-*) pre=(--prerelease) ;; esac
+          # --verify-tag: fail, saying so, if the tag isn't on GitHub.
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag "${pre[@]}" \
+            --title "Examples $GITHUB_REF_NAME" \
+            --notes "Number and Alerts example plugins, built from $GITHUB_SHA."

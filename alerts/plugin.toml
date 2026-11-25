@@ -1,0 +1,43 @@
+# Alerts: a robot's active alerts (WPILib's Alert class), like the built-in
+# Alerts widget. The second example plugin: bound to a table (an alert
+# group, `.type` "Alerts"), with a tab mark, a tone and a pulse. Its settings
+# use the built-in's names, so a widget can switch between the two and keep
+# them.
+name = "alerts"
+version = "0.1.0"
+api = "0.3"
+
+[match]
+type = "Alerts"
+
+[size]
+default = [2, 2]
+min = [1, 1]
+
+[properties]
+# Every alert group on the server, not just the widget's.
+all_groups = { type = "bool", default = false }
+# List the alerts' text beside or below the circle.
+show_text = { type = "bool", default = true }
+# auto: beside a wide widget, below a tall one.
+text_position = { type = "enum", default = "auto", options = ["auto", "right", "below"] }
+# The least urgent level shown.
+min_level = { type = "enum", default = "info", options = ["info", "warning", "error"] }
+# Pulse when a new error arrives, for this many seconds.
+pulse = { type = "bool", default = true }
+pulse_seconds = { type = "number", default = 5 }
+# Play a sound when a new error arrives.
+sound = { type = "bool", default = false }
+tone = { type = "sound", default = "beep" }
+
+# What the sandbox window (raptaboard plugin dev) starts with.
+[sandbox.values]
+errors = ["Encoder lost"]
+warnings = ["Battery low", "Hot motor"]
+infos = ["Vision connected"]
+
+[permissions]
+# The sound for a new error.
+sound = true
+# Keep reading alerts while the tab is closed, for its tab mark.
+background = true

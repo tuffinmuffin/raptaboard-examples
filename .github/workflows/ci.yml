@@ -95,3 +95,7 @@ jobs:
           else
             gh pr comment "$PR" --body-file coverage.md
           fi
+      # The goal: at least 80% of lines, so the examples show tested code.
+      # Last, so the report is posted first either way.
+      - name: At least 80% of lines covered
+        run: cargo llvm-cov report --ignore-filename-regex '/(tests|benches)/' --fail-under-lines 80

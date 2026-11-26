@@ -20,9 +20,18 @@ cargo build --release --target wasm32-wasip2   # target/wasm32-wasip2/release/<n
 cargo test                                     # each plugin's tests, in raptaboard's runtime
 ```
 
-CI also posts each pull request's line coverage (`cargo llvm-cov`, with
-`scripts/coverage_summary.py`). It counts the unit tests in each plugin's `src/`: the harness tests
-run the plugin as WebAssembly, which it can't measure.
+### How the plugins are built for testing
+
+Each plugin keeps what it decides and draws in plain functions: its settings are read once into a
+`Settings` struct, and its values, the text measurer and the like are passed in, so unit tests in
+`src/` check the logic directly, without the dashboard. The `Widget` methods only fetch from the
+host (`host::get`, `property_*`, `host::measure_text`), hand everything to that code, and act on
+what it returns (Alerts' tone). The harness tests in `tests/` then run the built WebAssembly in
+raptaboard's own runtime, end to end.
+
+CI posts each pull request's line coverage (`cargo llvm-cov`, with
+`scripts/coverage_summary.py`) and fails under **80%**. It counts the unit tests in `src/`: the
+harness tests run the plugin as WebAssembly, which it can't measure.
 
 Try one in raptaboard's sandbox window, from a raptaboard checkout:
 

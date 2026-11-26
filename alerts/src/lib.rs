@@ -404,9 +404,14 @@ fn circle(
     }
 }
 
+/// How tall text is drawn, wrapped at a width: the host's `measure-text` in
+/// the plugin, a stand-in in tests.
+type Measure<'a> = &'a dyn Fn(&str, Option<f32>) -> f32;
+
 /// The alerts listed in `area`, each with its sign, long text wrapped; the
 /// group's name first when there's more than one group. `note` heads the
-/// list. What doesn't fit is counted at the end.
+/// list. What doesn't fit is counted at the end. `measure` says how tall a
+/// text is at the list's size.
 fn list(
     shapes: &mut Vec<Shape>,
     theme: &Theme,
@@ -414,6 +419,7 @@ fn list(
     alerts: &[ActiveAlert],
     note: Option<&str>,
     dim: bool,
+    measure: Measure,
 ) {
     let mut y = area.y0;
     let line_height = TEXT_SIZE * 1.3;
@@ -426,7 +432,7 @@ fn list(
             theme.weak_text,
             Some(width),
         ));
-        y += host::measure_text(note, TEXT_SIZE, Some(width), false).height + 4.0;
+        y += measure(note, Some(width)) + 4.0;
     }
     if alerts.is_empty() && note.is_none() {
         shapes.push(text(
@@ -448,9 +454,7 @@ fn list(
         } else {
             a.text.clone()
         };
-        let height = host::measure_text(&shown, TEXT_SIZE, Some(width), false)
-            .height
-            .max(line_height);
+        let height = measure(&shown, Some(width)).max(line_height);
         // Not enough room for this one: say how many more there are.
         if y + height > area.y1 && i > 0 {
             shapes.push(text(
@@ -499,9 +503,65 @@ fn summary(counts: [usize; 3], freshness: Freshness) -> String {
     )
 }
 
-/// The least urgent level shown, from `min_level`.
-fn min_level() -> Severity {
-    Severity::from_name(&property_string("min_level", "info")).unwrap_or(Severity::Info)
+/// The widget's settings (plugin.toml's `[properties]`), read once a call:
+/// everything after that is plain code, tested without the dashboard.
+#[derive(Debug, Clone, PartialEq)]
+struct Settings {
+    all_groups: bool,
+    show_text: bool,
+    text_position: String,
+    /// The least urgent level shown.
+    min_level: Severity,
+    pulse: bool,
+    pulse_seconds: f64,
+    sound: bool,
+    tone: String,
+}
+
+impl Default for Settings {
+    /// plugin.toml's defaults.
+    fn default() -> Self {
+        Settings {
+            all_groups: false,
+            show_text: true,
+            text_position: "auto".into(),
+            min_level: Severity::Info,
+            pulse: true,
+            pulse_seconds: DEFAULT_PULSE_S,
+            sound: false,
+            tone: "beep".into(),
+        }
+    }
+}
+
+impl Settings {
+    /// The settings the dashboard gives this widget.
+    fn read() -> Settings {
+        let d = Settings::default();
+        Settings {
+            all_groups: property_bool("all_groups", d.all_groups),
+            show_text: property_bool("show_text", d.show_text),
+            text_position: property_string("text_position", &d.text_position),
+            min_level: Severity::from_name(&property_string("min_level", "info"))
+                .unwrap_or(d.min_level),
+            pulse: property_bool("pulse", d.pulse),
+            pulse_seconds: property_number("pulse_seconds", d.pulse_seconds),
+            sound: property_bool("sound", d.sound),
+            tone: property_string("tone", &d.tone),
+        }
+    }
+}
+
+/// The tab's mark for `alerts` at `lowest`: the most urgent level shown
+/// above info (errors and warnings mark the tab, infos don't).
+fn mark(alerts: &[ActiveAlert], lowest: Severity) -> Option<Level> {
+    alerts
+        .iter()
+        .map(|a| a.severity)
+        .filter(|s| *s <= lowest)
+        .min()
+        .filter(|s| *s != Severity::Info)
+        .map(Severity::level)
 }
 
 #[derive(Default)]
@@ -517,18 +577,22 @@ struct Alerts {
 }
 
 impl Alerts {
-    /// What's published now, errors first across groups; `None` if nothing is.
-    fn current(&self) -> Option<Vec<ActiveAlert>> {
-        let get = |topic: &str| host::get(topic);
-        if !property_bool("all_groups", false) {
+    /// What's published now, errors first across groups; `None` if nothing
+    /// is. `get` reads a topic (the host's `get` in the plugin).
+    fn current(
+        &self,
+        all_groups: bool,
+        get: &impl Fn(&str) -> Option<NtValue>,
+    ) -> Option<Vec<ActiveAlert>> {
+        if !all_groups {
             // The widget's own table: its keys, the group's name not needed.
-            return read_group("", "", &get);
+            return read_group("", "", get);
         }
         let mut found = false;
         let mut all = Vec::new();
         for table in &self.tables {
             let group = table.rsplit('/').next().unwrap_or(table);
-            if let Some(alerts) = read_group(&format!("{table}/"), group, &get) {
+            if let Some(alerts) = read_group(&format!("{table}/"), group, get) {
                 found = true;
                 all.extend(alerts);
             }
@@ -536,22 +600,10 @@ impl Alerts {
         all.sort_by_key(|a| a.severity);
         found.then_some(all)
     }
-}
 
-impl Widget for Alerts {
-    fn subscriptions(&self) -> Vec<Subscription> {
-        if property_bool("all_groups", false) {
-            vec![Subscription::TablesOfType(ALERTS_TYPE.into())]
-        } else {
-            Severity::ALL
-                .iter()
-                .map(|s| Subscription::Key(s.key().into()))
-                .collect()
-        }
-    }
-
-    fn update(&mut self, samples: Vec<Sample>) {
-        // Every group's `.type` comes with `all_groups`: that's how they're found.
+    /// New values: with `all_groups`, every group's `.type` comes, which is
+    /// how the groups are found (and lost).
+    fn see(&mut self, samples: Vec<Sample>) {
         for s in samples {
             if let Some(table) = s.topic.strip_suffix("/.type") {
                 match s.value {
@@ -566,36 +618,41 @@ impl Widget for Alerts {
         }
     }
 
-    fn render(&mut self, frame: FrameInfo) -> Picture {
+    /// The picture for `frame`, from what's published now (`current`), and
+    /// the tone to play, if a new error calls for one.
+    fn draw(
+        &mut self,
+        settings: &Settings,
+        current: Option<Vec<ActiveAlert>>,
+        frame: &FrameInfo,
+        measure: Measure,
+    ) -> (Picture, Option<String>) {
         let now = frame.time_s;
-        let all_groups = property_bool("all_groups", false);
-        let seen = self.watch.update(self.current(), frame.connected);
+        let seen = self.watch.update(current, frame.connected);
         // A new error: pulse, and maybe a tone.
+        let mut tone = None;
         if seen.new_error {
-            if property_bool("pulse", true) {
-                self.pulse_until = now + property_number("pulse_seconds", DEFAULT_PULSE_S);
+            if settings.pulse {
+                self.pulse_until = now + settings.pulse_seconds;
             }
-            if property_bool("sound", false)
-                && self.last_tone.is_none_or(|last| now - last >= TONE_GAP_S)
-            {
+            if settings.sound && self.last_tone.is_none_or(|last| now - last >= TONE_GAP_S) {
                 self.last_tone = Some(now);
-                if let Err(e) = host::play_sound(&property_string("tone", "beep")) {
-                    host::log(&format!("no sound: {e}"));
-                }
+                tone = Some(settings.tone.clone());
             }
         }
         let (note, dim) = match seen.freshness {
             Freshness::Current => (None, false),
             Freshness::NotPublishedNow => (Some("Not published now: the last alerts seen"), true),
-            Freshness::NeverPublished if all_groups => (Some("No alert groups published"), false),
+            Freshness::NeverPublished if settings.all_groups => {
+                (Some("No alert groups published"), false)
+            }
             Freshness::NeverPublished => (Some("Alerts not published"), false),
             Freshness::Disconnected => (Some("Robot disconnected: the last alerts seen"), true),
         };
-        let lowest = min_level();
         let shown: Vec<ActiveAlert> = seen
             .alerts
             .into_iter()
-            .filter(|a| a.severity <= lowest)
+            .filter(|a| a.severity <= settings.min_level)
             .collect();
         let counts = counts(&shown);
         // The pulse stops once the errors are gone, not only when its time is up.
@@ -615,11 +672,7 @@ impl Widget for Alerts {
             x1: frame.size.width,
             y1: frame.size.height,
         };
-        let (circle_area, text_area) = layout(
-            whole,
-            property_bool("show_text", true),
-            &property_string("text_position", "auto"),
-        );
+        let (circle_area, text_area) = layout(whole, settings.show_text, &settings.text_position);
         circle(
             &mut picture.shapes,
             &frame.theme,
@@ -629,24 +682,56 @@ impl Widget for Alerts {
             dim,
         );
         if let Some(area) = text_area {
-            list(&mut picture.shapes, &frame.theme, area, &shown, note, dim);
+            list(
+                &mut picture.shapes,
+                &frame.theme,
+                area,
+                &shown,
+                note,
+                dim,
+                measure,
+            );
         }
         picture.summary = Some(summary(counts, seen.freshness));
+        (picture, tone)
+    }
+}
+
+/// The dashboard's side: each call reads the settings and values from the
+/// host and hands them to the plain code above.
+impl Widget for Alerts {
+    fn subscriptions(&self) -> Vec<Subscription> {
+        if Settings::read().all_groups {
+            vec![Subscription::TablesOfType(ALERTS_TYPE.into())]
+        } else {
+            Severity::ALL
+                .iter()
+                .map(|s| Subscription::Key(s.key().into()))
+                .collect()
+        }
+    }
+
+    fn update(&mut self, samples: Vec<Sample>) {
+        self.see(samples);
+    }
+
+    fn render(&mut self, frame: FrameInfo) -> Picture {
+        let settings = Settings::read();
+        let current = self.current(settings.all_groups, &host::get);
+        let measure = |t: &str, w: Option<f32>| host::measure_text(t, TEXT_SIZE, w, false).height;
+        let (picture, tone) = self.draw(&settings, current, &frame, &measure);
+        if let Some(tone) = tone
+            && let Err(e) = host::play_sound(&tone)
+        {
+            host::log(&format!("no sound: {e}"));
+        }
         picture
     }
 
-    /// The most urgent level above info shown: errors and warnings mark the
-    /// tab, infos don't.
     fn tab_mark(&self) -> Option<Level> {
-        let lowest = min_level();
-        self.current()
-            .unwrap_or_default()
-            .iter()
-            .map(|a| a.severity)
-            .filter(|s| *s <= lowest)
-            .min()
-            .filter(|s| *s != Severity::Info)
-            .map(Severity::level)
+        let settings = Settings::read();
+        let current = self.current(settings.all_groups, &host::get);
+        mark(&current.unwrap_or_default(), settings.min_level)
     }
 }
 
@@ -762,5 +847,393 @@ mod tests {
     fn fading_scales_only_the_opacity() {
         let c = color(10, 20, 30);
         assert_eq!(fade(c, 0.5), Color { a: 128, ..c });
+    }
+
+    const THEME: Theme = Theme {
+        dark: true,
+        text: Color {
+            r: 230,
+            g: 230,
+            b: 230,
+            a: 255,
+        },
+        weak_text: Color {
+            r: 120,
+            g: 120,
+            b: 120,
+            a: 255,
+        },
+        background: Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        },
+        card: Color {
+            r: 20,
+            g: 20,
+            b: 20,
+            a: 255,
+        },
+        accent: Color {
+            r: 0,
+            g: 100,
+            b: 200,
+            a: 255,
+        },
+        error: Color {
+            r: 220,
+            g: 0,
+            b: 0,
+            a: 255,
+        },
+        warning: Color {
+            r: 220,
+            g: 180,
+            b: 0,
+            a: 255,
+        },
+        info: Color {
+            r: 0,
+            g: 120,
+            b: 220,
+            a: 255,
+        },
+    };
+
+    fn frame(width: f32, height: f32, time_s: f64, connected: bool) -> FrameInfo {
+        FrameInfo {
+            size: Size { width, height },
+            time_s,
+            connected,
+            locked: false,
+            theme: THEME,
+        }
+    }
+
+    /// Every text one line, 16 pixels high, as wide as it likes.
+    fn one_line(_: &str, _: Option<f32>) -> f32 {
+        16.0
+    }
+
+    fn area(w: f32, h: f32) -> Area {
+        Area {
+            x0: 0.0,
+            y0: 0.0,
+            x1: w,
+            y1: h,
+        }
+    }
+
+    fn texts(shapes: &[Shape]) -> Vec<&str> {
+        shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn colors_of_lines(shapes: &[Shape]) -> Vec<Color> {
+        shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Line(l) => Some(l.stroke.color),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn levels_have_names_tab_marks_and_colors() {
+        assert_eq!(Severity::from_name("warning"), Some(Severity::Warning));
+        assert_eq!(Severity::from_name("warnings"), None);
+        assert_eq!(Severity::Error.level(), Level::Error);
+        assert_eq!(Severity::Warning.level(), Level::Warning);
+        assert_eq!(Severity::Info.level(), Level::Info);
+        assert_eq!(Severity::Info.color(&THEME), THEME.info);
+        assert_eq!(Severity::Warning.color(&THEME), THEME.warning);
+        assert_eq!(Severity::Error.key(), "errors");
+    }
+
+    #[test]
+    fn an_error_is_a_cross_and_the_others_a_bar_and_a_dot() {
+        let mut shapes = Vec::new();
+        sign(&mut shapes, Severity::Error, 0.0, 0.0, 10.0, THEME.error);
+        assert_eq!(colors_of_lines(&shapes), [THEME.error, THEME.error]);
+        for s in [Severity::Warning, Severity::Info] {
+            let mut shapes = Vec::new();
+            sign(&mut shapes, s, 0.0, 0.0, 10.0, THEME.info);
+            let dot_y = match &shapes[1] {
+                Shape::Circle(c) => c.center.y,
+                other => panic!("{other:?}"),
+            };
+            // A warning's dot is at the bottom (!), an info's at the top (i).
+            assert_eq!(dot_y > 0.0, s == Severity::Warning, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn the_circle_lights_signs_counts_and_ring_by_level() {
+        let mut shapes = Vec::new();
+        circle(
+            &mut shapes,
+            &THEME,
+            area(100.0, 100.0),
+            [2, 0, 1],
+            0.0,
+            false,
+        );
+        let ring = match &shapes[0] {
+            Shape::Circle(c) => c.stroke.unwrap().color,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(ring, THEME.error, "the most urgent color");
+        assert_eq!(texts(&shapes), ["2"], "a count only over 1");
+        // The error cross is lit; the warning's bar is off.
+        let lines = colors_of_lines(&shapes);
+        assert!(lines.contains(&THEME.error));
+        assert!(lines.contains(&fade(THEME.weak_text, 0.5)));
+        // Dimmed: lit signs grey. Pulsing: a red fill first.
+        let mut dimmed = Vec::new();
+        circle(
+            &mut dimmed,
+            &THEME,
+            area(100.0, 100.0),
+            [1, 0, 0],
+            0.0,
+            true,
+        );
+        assert!(colors_of_lines(&dimmed).contains(&THEME.weak_text));
+        let mut pulsing = Vec::new();
+        circle(
+            &mut pulsing,
+            &THEME,
+            area(100.0, 100.0),
+            [1, 0, 0],
+            1.0,
+            false,
+        );
+        assert!(matches!(&pulsing[0], Shape::Circle(c) if c.fill == Some(fade(THEME.error, 0.5))));
+        // Too small to draw: nothing.
+        let mut tiny = Vec::new();
+        circle(&mut tiny, &THEME, area(6.0, 6.0), [1, 0, 0], 0.0, false);
+        assert!(tiny.is_empty());
+    }
+
+    #[test]
+    fn the_list_names_groups_says_when_empty_and_counts_what_doesnt_fit() {
+        let mut shapes = Vec::new();
+        list(
+            &mut shapes,
+            &THEME,
+            area(200.0, 100.0),
+            &[],
+            None,
+            false,
+            &one_line,
+        );
+        assert_eq!(texts(&shapes), ["No active alerts"]);
+
+        let two_groups = [
+            ActiveAlert {
+                group: "Arm".into(),
+                ..alert(Severity::Error, "hot")
+            },
+            ActiveAlert {
+                group: "Drive".into(),
+                ..alert(Severity::Info, "ok")
+            },
+        ];
+        let mut shapes = Vec::new();
+        list(
+            &mut shapes,
+            &THEME,
+            area(200.0, 100.0),
+            &two_groups,
+            Some("Note"),
+            false,
+            &one_line,
+        );
+        assert_eq!(texts(&shapes), ["Note", "Arm: hot", "Drive: ok"]);
+
+        // Room for three lines of about 17: the rest counted.
+        let many: Vec<ActiveAlert> = (0..6)
+            .map(|i| alert(Severity::Warning, &i.to_string()))
+            .collect();
+        let mut shapes = Vec::new();
+        list(
+            &mut shapes,
+            &THEME,
+            area(200.0, 60.0),
+            &many,
+            None,
+            true,
+            &one_line,
+        );
+        assert_eq!(texts(&shapes), ["0", "1", "2", "+3 more"]);
+        assert!(
+            colors_of_lines(&shapes)
+                .iter()
+                .all(|c| *c == THEME.weak_text),
+            "dimmed"
+        );
+    }
+
+    #[test]
+    fn a_new_error_pulses_and_sounds_once_but_not_on_the_first_look() {
+        let s = Settings {
+            sound: true,
+            ..Settings::default()
+        };
+        let mut w = Alerts::default();
+        let errors = |t: &[&str]| Some(t.iter().map(|t| alert(Severity::Error, t)).collect());
+        let (p, tone) = w.draw(
+            &s,
+            errors(&["a"]),
+            &frame(200.0, 100.0, 0.0, true),
+            &one_line,
+        );
+        assert_eq!((tone, p.redraw_in_s), (None, None), "already up");
+        let (p, tone) = w.draw(
+            &s,
+            errors(&["a", "b"]),
+            &frame(200.0, 100.0, 1.0, true),
+            &one_line,
+        );
+        assert_eq!(tone.as_deref(), Some("beep"));
+        assert_eq!(p.redraw_in_s, Some(PULSE_FRAME_S), "pulsing");
+        // Another new error within the gap: a pulse, no second tone.
+        let (_, tone) = w.draw(
+            &s,
+            errors(&["a", "b", "c"]),
+            &frame(200.0, 100.0, 2.0, true),
+            &one_line,
+        );
+        assert_eq!(tone, None);
+        let (_, tone) = w.draw(
+            &s,
+            errors(&["d"]),
+            &frame(200.0, 100.0, 5.0, true),
+            &one_line,
+        );
+        assert_eq!(tone.as_deref(), Some("beep"));
+        // The errors gone: the pulse stops at once.
+        let (p, _) = w.draw(&s, Some(vec![]), &frame(200.0, 100.0, 5.5, true), &one_line);
+        assert_eq!(p.redraw_in_s, None);
+        // No sound or pulse when they're off.
+        let quiet = Settings {
+            pulse: false,
+            ..Settings::default()
+        };
+        let mut w = Alerts::default();
+        w.draw(
+            &quiet,
+            errors(&["a"]),
+            &frame(200.0, 100.0, 0.0, true),
+            &one_line,
+        );
+        let (p, tone) = w.draw(
+            &quiet,
+            errors(&["b"]),
+            &frame(200.0, 100.0, 1.0, true),
+            &one_line,
+        );
+        assert_eq!((tone, p.redraw_in_s), (None, None));
+    }
+
+    #[test]
+    fn the_picture_says_how_fresh_it_is_and_shows_only_the_levels_asked_for() {
+        let mut w = Alerts::default();
+        let s = Settings::default();
+        let f = |connected| frame(300.0, 100.0, 0.0, connected);
+        let (p, _) = w.draw(&s, None, &f(true), &one_line);
+        assert!(texts(&p.shapes).contains(&"Alerts not published"));
+        let all = Settings {
+            all_groups: true,
+            ..Settings::default()
+        };
+        let (p, _) = Alerts::default().draw(&all, None, &f(true), &one_line);
+        assert!(texts(&p.shapes).contains(&"No alert groups published"));
+        let some = Some(vec![
+            alert(Severity::Warning, "w"),
+            alert(Severity::Info, "i"),
+        ]);
+        let (p, _) = w.draw(&s, some.clone(), &f(true), &one_line);
+        assert_eq!(p.summary.as_deref(), Some("0 errors, 1 warning, 1 info"));
+        let (p, _) = w.draw(&s, None, &f(true), &one_line);
+        assert!(texts(&p.shapes).contains(&"Not published now: the last alerts seen"));
+        let (p, _) = w.draw(&s, None, &f(false), &one_line);
+        assert_eq!(
+            p.summary.as_deref(),
+            Some("0 errors, 1 warning, 1 info (disconnected)")
+        );
+        let warnings_up = Settings {
+            min_level: Severity::Warning,
+            show_text: false,
+            ..s
+        };
+        let (p, _) = w.draw(&warnings_up, some, &f(true), &one_line);
+        assert_eq!(p.summary.as_deref(), Some("0 errors, 1 warning, 0 infos"));
+        assert!(texts(&p.shapes).is_empty(), "no list");
+    }
+
+    #[test]
+    fn every_group_is_found_by_its_type_and_read() {
+        let mut w = Alerts::default();
+        let ty = |topic: &str, t: &str| Sample {
+            topic: topic.into(),
+            value: Some(NtValue::Str(t.into())),
+            time_us: 0,
+        };
+        w.see(vec![
+            ty("/Arm/.type", "Alerts"),
+            ty("/Drive/.type", "Alerts"),
+            ty("/X/.type", "Other"),
+        ]);
+        assert_eq!(w.tables.iter().collect::<Vec<_>>(), ["/Arm", "/Drive"]);
+        w.see(vec![Sample {
+            topic: "/Drive/.type".into(),
+            value: None,
+            time_us: 1,
+        }]);
+        assert_eq!(w.tables.len(), 1, "gone");
+        w.see(vec![ty("/Drive/.type", "Alerts")]);
+        let get = |topic: &str| match topic {
+            "/Arm/infos" => Some(NtValue::StrArray(vec!["arm ok".into()])),
+            "/Drive/errors" => Some(NtValue::StrArray(vec!["stall".into()])),
+            "errors" => Some(NtValue::StrArray(vec!["own".into()])),
+            _ => None,
+        };
+        let all = w.current(true, &get).unwrap();
+        let named: Vec<(&str, &str)> = all
+            .iter()
+            .map(|a| (a.group.as_str(), a.text.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            [("Drive", "stall"), ("Arm", "arm ok")],
+            "errors first"
+        );
+        assert_eq!(w.current(false, &get).unwrap()[0].text, "own");
+        assert!(
+            Alerts::default().current(true, &get).is_none(),
+            "no groups seen"
+        );
+    }
+
+    #[test]
+    fn errors_and_warnings_mark_the_tab_and_infos_dont() {
+        let both = [alert(Severity::Info, "i"), alert(Severity::Warning, "w")];
+        assert_eq!(mark(&both, Severity::Info), Some(Level::Warning));
+        assert_eq!(mark(&both[..1], Severity::Info), None);
+        assert_eq!(
+            mark(&[alert(Severity::Error, "e")], Severity::Info),
+            Some(Level::Error)
+        );
+        // Warnings not shown: no mark for them.
+        assert_eq!(mark(&both, Severity::Error), None);
+        assert_eq!(Settings::default().min_level, Severity::Info);
     }
 }

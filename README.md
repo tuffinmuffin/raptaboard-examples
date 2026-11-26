@@ -20,6 +20,10 @@ cargo build --release --target wasm32-wasip2   # target/wasm32-wasip2/release/<n
 cargo test                                     # each plugin's tests, in raptaboard's runtime
 ```
 
+CI also posts each pull request's line coverage (`cargo llvm-cov`, with
+`scripts/coverage_summary.py`). It counts the unit tests in each plugin's `src/`: the harness tests
+run the plugin as WebAssembly, which it can't measure.
+
 Try one in raptaboard's sandbox window, from a raptaboard checkout:
 
 ```sh

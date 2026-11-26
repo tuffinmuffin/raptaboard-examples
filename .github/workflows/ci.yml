@@ -31,3 +31,67 @@ jobs:
       # raptaboard's own plugin runtime.
       - run: cargo test
       - run: cargo build --release --target wasm32-wasip2
+
+  # Line coverage of each plugin's unit tests, posted on the PR (and in the
+  # job summary) with the change against the base branch.
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Folders named tests or benches, not this repo's name (raptaboard-examples).
+      COV_ARGS: --workspace --ignore-filename-regex /(tests|benches)/
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Measure this commit
+        run: |
+          cargo llvm-cov $COV_ARGS --json --summary-only --output-path coverage.json
+          cargo llvm-cov report --html --ignore-filename-regex '/(tests|benches)/'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: target/llvm-cov/html
+      - name: Measure the base branch
+        if: github.event_name == 'pull_request'
+        run: |
+          git worktree add -q ../base "${{ github.event.pull_request.base.sha }}"
+          (cd ../base && cargo llvm-cov $COV_ARGS --json --summary-only \
+              --output-path "$GITHUB_WORKSPACE/base.json") \
+            || echo "::warning::Could not measure the base branch; the report has no comparison."
+      - name: Write the report
+        env:
+          COV_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          COV_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          COV_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/coverage_summary.py coverage.json base.json > coverage.md
+          cat coverage.md >> "$GITHUB_STEP_SUMMARY"
+      # Fork PRs get a read-only token, so they only have the job summary.
+      - name: Post or update the PR comment
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            --jq '.[] | select(.body | startswith("<!-- raptaboard-examples-coverage -->")) | .id' | head -n 1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@coverage.md > /dev/null
+          else
+            gh pr comment "$PR" --body-file coverage.md
+          fi

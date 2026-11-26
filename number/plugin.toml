@@ -1,0 +1,24 @@
+# Number: a number topic as text, like the built-in Text Display. The first
+# example plugin; its settings use the Text Display's names, so a widget can
+# switch between the two and keep them.
+name = "number"
+version = "0.1.0"
+api = "0.3"
+
+[match]
+topic_types = ["double", "float", "int"]
+
+[size]
+default = [1, 1]
+min = [1, 1]
+
+[properties]
+# -1: up to 4 places, trailing zeros dropped.
+decimal_places = { type = "number", default = -1 }
+font_size = { type = "number", default = 14 }
+fit_text = { type = "bool", default = false }
+show_unit = { type = "bool", default = true }
+
+# What the sandbox window (raptaboard plugin dev) starts with.
+[sandbox]
+value = 1.23456
